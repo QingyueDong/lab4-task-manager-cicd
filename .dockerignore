@@ -1,0 +1,7 @@
+# Files Docker must NOT send into the build context.
+# .git can contain the workflow's GITHUB_TOKEN (actions/checkout stores it in the
+# repo's git config), so it must never end up inside an image layer.
+.git
+**/__pycache__
+**/*.pyc
+.DS_Store

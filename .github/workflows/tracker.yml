@@ -1,0 +1,198 @@
+# =============================================================================
+# Lab 4 / Lecture 4 - Activity 9: tracker.yml  ("GitHub Projects Automation")
+#
+# When a pull request is MERGED, set Status = "Done" on the project-board item of
+# every issue that the PR closes ("Closes #12", "Fixes #12", "Resolves #12").
+#
+# ---------------------------------------------------------------------------
+# READ THIS FIRST - why this is not the slides' curl command
+#   The slides POST to https://api.github.com/projects/columns/<COLUMN_ID>/cards.
+#   That is the REST API of *Projects (classic)*, which GitHub has deprecated
+#   ("closing down"). New projects (Projects v2) have no columns or cards - a board
+#   column is just a value of the single-select field "Status" - and can only be
+#   automated through the GraphQL API. (The slides' payload also reads
+#   github.event.issue.id, which does not exist in a pull_request event.)
+#
+# RECOMMENDED (no code): Projects v2 built-in workflows
+#   Project -> ... (menu) -> Workflows -> "Item closed" and "Pull request merged"
+#   -> set Status: Done (both are ON by default). Use that for a reliable result.
+#
+# THIS FILE (optional, mirrors the course activity): GraphQL via actions/github-script.
+#   Setup:
+#     1. Create a personal access token (classic) with scope `project`
+#        (add `repo` only if this repository is private).
+#        GITHUB_TOKEN cannot be used: it is scoped to the repository and cannot
+#        access user-owned projects.
+#     2. Repo Settings -> Secrets and variables -> Actions
+#          Secrets   tab: PROJECTS_TOKEN = <the token>
+#          Variables tab: PROJECT_NUMBER = <N from https://github.com/users/<you>/projects/<N>>
+#        Optional variables: PROJECT_OWNER (default: repo owner),
+#          PROJECT_STATUS_FIELD (default: Status), PROJECT_DONE_OPTION (default: Done)
+#   If the secret/variable is missing, the job prints a warning and skips (stays green).
+# =============================================================================
+name: GitHub Projects Automation
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  move-issue-to-done:
+    # Control flow: "closed" also fires when a PR is closed WITHOUT merging - skip those.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+      PROJECT_OWNER: ${{ vars.PROJECT_OWNER || github.repository_owner }}
+      PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+      STATUS_FIELD: ${{ vars.PROJECT_STATUS_FIELD || 'Status' }}
+      DONE_OPTION: ${{ vars.PROJECT_DONE_OPTION || 'Done' }}
+
+    steps:
+      # (The slides start with actions/checkout. It is not needed here: this job only
+      #  talks to the GitHub API and never reads files from the repository.)
+
+      - name: Check configuration
+        id: config
+        run: |
+          if [ -z "$PROJECTS_TOKEN" ] || [ -z "$PROJECT_NUMBER" ]; then
+            echo "::warning title=tracker.yml not configured::Add secret PROJECTS_TOKEN and variable PROJECT_NUMBER (see comments at the top of tracker.yml). Skipping - the project's built-in workflows can still move the issue."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "PR #${{ github.event.pull_request.number }} was merged -> updating project ${PROJECT_OWNER}/#${PROJECT_NUMBER}"
+          fi
+
+      - name: Move linked issues to "Done" (Projects v2 GraphQL API)
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/github-script@v7      # newer major v8 (Node 24) also exists
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const owner = process.env.PROJECT_OWNER;
+            const projectNumber = parseInt(process.env.PROJECT_NUMBER, 10);
+            const statusFieldName = process.env.STATUS_FIELD;
+            const doneOptionName = process.env.DONE_OPTION;
+            const { owner: repoOwner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+
+            // 1) Find the project, its "Status" field and the "Done" option ----------
+            //    (works for projects owned by a user OR by an organization)
+            const projectQuery = `
+              query($owner: String!, $number: Int!) {
+                repositoryOwner(login: $owner) {
+                  ... on User         { projectV2(number: $number) { ...ProjectInfo } }
+                  ... on Organization { projectV2(number: $number) { ...ProjectInfo } }
+                }
+              }
+              fragment ProjectInfo on ProjectV2 {
+                id
+                title
+                fields(first: 50) {
+                  nodes {
+                    ... on ProjectV2SingleSelectField { id name options { id name } }
+                  }
+                }
+              }`;
+            let project;
+            try {
+              const data = await github.graphql(projectQuery, { owner, number: projectNumber });
+              project = data.repositoryOwner && data.repositoryOwner.projectV2;
+            } catch (err) {
+              core.setFailed(`Could not read project #${projectNumber} of "${owner}": ${err.message}. ` +
+                             `Check PROJECT_NUMBER and that PROJECTS_TOKEN has the "project" scope.`);
+              return;
+            }
+            if (!project) {
+              core.setFailed(`Project #${projectNumber} not found for owner "${owner}".`);
+              return;
+            }
+            const statusField = project.fields.nodes.find(f => f && f.name === statusFieldName && f.options);
+            if (!statusField) {
+              core.setFailed(`Project "${project.title}" has no single-select field named "${statusFieldName}".`);
+              return;
+            }
+            const doneOption = statusField.options.find(o => o.name.toLowerCase() === doneOptionName.toLowerCase());
+            if (!doneOption) {
+              core.setFailed(`Field "${statusFieldName}" has no option "${doneOptionName}". ` +
+                             `Options: ${statusField.options.map(o => o.name).join(", ")}`);
+              return;
+            }
+            core.info(`Project: "${project.title}" | field "${statusField.name}" -> option "${doneOption.name}"`);
+
+            // 2) Which issues does this PR close? -----------------------------------
+            //    a) GitHub's own link list (filled by "Closes #n" or the PR sidebar)
+            const prQuery = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 25) { nodes { number } }
+                  }
+                }
+              }`;
+            const prData = await github.graphql(prQuery, { owner: repoOwner, repo, number: pr.number });
+            const numbers = new Set(prData.repository.pullRequest.closingIssuesReferences.nodes.map(n => n.number));
+            //    b) Fallback: parse the PR description ourselves
+            const keyword = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)\b/gi;
+            for (const m of (pr.body || "").matchAll(keyword)) numbers.add(parseInt(m[1], 10));
+
+            if (numbers.size === 0) {
+              core.notice(`PR #${pr.number} does not close any issue (no "Closes #n" in the description). Nothing to do.`);
+              return;
+            }
+
+            // 3) For each issue: find (or create) its item on the board, then set Done
+            const issueQuery = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    id
+                    number
+                    title
+                    projectItems(first: 50) { nodes { id project { id } } }
+                  }
+                }
+              }`;
+            const addItem = `
+              mutation($project: ID!, $content: ID!) {
+                addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
+              }`;
+            const setStatus = `
+              mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project, itemId: $item, fieldId: $field,
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }`;
+
+            const moved = [];
+            for (const number of numbers) {
+              const res = await github.graphql(issueQuery, { owner: repoOwner, repo, number });
+              const issue = res.repository && res.repository.issue;
+              if (!issue) {
+                core.warning(`#${number} is not an issue in ${repoOwner}/${repo} - skipped.`);
+                continue;
+              }
+              let item = issue.projectItems.nodes.find(n => n.project && n.project.id === project.id);
+              let itemId = item && item.id;
+              if (!itemId) {
+                const added = await github.graphql(addItem, { project: project.id, content: issue.id });
+                itemId = added.addProjectV2ItemById.item.id;
+                core.info(`Issue #${number} was not on the board - added it.`);
+              }
+              await github.graphql(setStatus, {
+                project: project.id, item: itemId, field: statusField.id, option: doneOption.id,
+              });
+              core.info(`Moved issue #${number} "${issue.title}" to "${doneOption.name}".`);
+              moved.push(`#${number} ${issue.title}`);
+            }
+
+            await core.summary
+              .addHeading(`PR #${pr.number} merged - project "${project.title}" updated`, 3)
+              .addList(moved.length ? moved.map(m => `${m} -> ${doneOption.name}`) : ["(no issues moved)"])
+              .write();

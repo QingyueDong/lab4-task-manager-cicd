@@ -1,0 +1,108 @@
+# =============================================================================
+# Lab 4 / Lecture 4 - Activity 8: ci.yml  ("CI Workflow - Docker")
+#
+#   pull_request -> build the image, run todo.py + unit tests (a CHECK on the PR, no commit)
+#   push to main -> same, then commit the regenerated index.html and publish it to Pages
+#
+# Changes vs. the slides (see CHANGES_vs_course_materials.md):
+#   * The slides run `docker run --rm -e GITHUB_USER=... task-manager:latest` without a
+#     volume, so update_index.sh edits /app/index.html INSIDE the container and the change
+#     disappears with --rm. Here the repo is mounted (-v ...:/workspace -w /workspace).
+#   * Commit/push happens on the runner with GITHUB_TOKEN (`permissions: contents: write`),
+#     not inside the container.
+#   * Tests also run on pull requests, so a broken change is caught BEFORE merge.
+#   * Pages is deployed from this run (GITHUB_TOKEN pushes don't trigger branch builds).
+# =============================================================================
+name: CI Workflow - Docker
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # cancel an outdated PR check when you push again; never cancel a run on main
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TZ: Australia/Sydney
+  IMAGE: task-manager:latest
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # to push index.html back (only used on main)
+
+    steps:
+      # Step 1: This action checks out the repository code to the runner's environment
+      # so that subsequent steps can access the project files.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Builds a Docker image named `task-manager` with the latest tag
+      # using the Dockerfile in the current directory.
+      - name: Build Docker image
+        run: docker build -t "$IMAGE" .
+
+      # Step 3: Runs the container built in the previous step.
+      #   -v/-w      mount the checked-out repo and work in it, so index.html changes persist
+      #   --user     run as the runner's user, so the edited file is not owned by root
+      #   -e ...     pass the GitHub username (as in the slides), commit SHA and time zone
+      #   --rm       remove the container after execution
+      # If the unit tests fail, entrypoint.sh exits 1 -> this step and the job fail (red X).
+      - name: Run Docker container (todo.py, unit tests, update index.html)
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:/workspace" -w /workspace \
+            -e GITHUB_USER="${{ github.actor }}" -e GITHUB_SHA -e TZ \
+            "$IMAGE"
+
+      - name: Show what changed in index.html
+        run: git --no-pager diff --stat -- index.html
+
+      # Step 4 (main only): commit the regenerated page.
+      - name: Commit and push index.html
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "CI: update index.html with tasks and test results [skip ci]" || { echo "No changes to commit"; exit 0; }
+          git push origin HEAD:main || {
+            echo "Push rejected (main moved) - rebasing and retrying once"
+            git pull --rebase origin main && git push origin HEAD:main
+          }
+
+      # Step 5 (main only): package the site for GitHub Pages (Settings -> Pages -> Source: GitHub Actions)
+      - name: Upload site for GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  # Job dependency: deploy only after build (and its tests) succeeded, and never for PRs.
+  deploy_pages:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,4 @@
+# macOS / Python clutter (local test runs create __pycache__)
+.DS_Store
+__pycache__/
+*.pyc
