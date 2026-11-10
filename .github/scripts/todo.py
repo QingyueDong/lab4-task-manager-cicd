@@ -54,13 +54,14 @@ class TaskPool:
         task6 = Task("Deploy to Production", status="ToDo")
         # Lab 4 Activity 10 (PR exercise): add a new task here, e.g.
         # task7 = Task("Configure CI pipeline", status="ToDo")
+        task7 = Task("Configure CI pipeline", status="ToDo")
         # ...then add it to the list below AND update the expected count in todo-test.py.
 
         task1.mark_completed()
         task2.mark_completed()
         task3.mark_completed()
 
-        self.tasks = [task1, task2, task3, task4, task5, task6]
+        self.tasks = [task1, task2, task3, task4, task5, task6, task7]
 
     # Adds a Task object to the pool
     def add_task(self, task):
