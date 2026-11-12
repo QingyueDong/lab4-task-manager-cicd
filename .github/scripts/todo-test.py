@@ -44,7 +44,7 @@ class TestTaskPool(unittest.TestCase):
         self.pool.populate()
         open_tasks = self.pool.get_open_tasks()
         # Lab 4 PR exercise: if you add a "ToDo" task in todo.py, change 3 -> 4 here.
-        self.assertEqual(len(open_tasks), 3)
+        self.assertEqual(len(open_tasks), 4)
         self.assertTrue(all(task.status == "ToDo" for task in open_tasks))
 
     def test_get_done_tasks(self):
